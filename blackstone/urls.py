@@ -1,3 +1,4 @@
+# blackstone/urls.py (modified)
 from django.contrib import admin
 from django.urls import path, include
 from django.conf.urls.static import static
@@ -5,6 +6,8 @@ from django.conf import settings
 from django.conf.urls import handler400, handler404, handler500
 from app.views import custom_error_404, custom_error_500
 
+# NEW: import healthz
+from uptime.views import healthz
 
 handler404 = custom_error_404
 handler500 = custom_error_500
@@ -15,6 +18,9 @@ urlpatterns = [
     path("captain/", include("user_admin.urls", namespace="admin")),
     path("hub/", include("user.urls", namespace="user")),
     path("auth/", include("django.contrib.auth.urls")),
+
+    # NEW: health check endpoint for external pingers
+    path("healthz/", healthz, name="healthz"),
 ]
 
 if settings.DEBUG:

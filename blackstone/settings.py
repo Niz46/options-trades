@@ -49,7 +49,7 @@ INSTALLED_APPS = [
 ]
 
 # The public URL of your Render service (used by the uptime thread)
-SELF_PING_URL = "https://profitnexusoptionhub.onrender.com/"
+SELF_PING_URL = "https://profitnexusoptionhub.onrender.com/healthz"
 
 # -----------------------------------------------------------------------------
 # 5) Middleware (including Whitenoise)

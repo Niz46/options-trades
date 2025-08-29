@@ -1,0 +1,19 @@
+name: ping-render-healthz
+on:
+  schedule:
+    - cron: '*/6 * * * *'   # every 6 minutes (UTC)
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    env:
+      SELF_PING_URL: ${{ secrets.SELF_PING_URL }}
+    steps:
+      - name: Ping Render health endpoint
+        run: |
+          if [ -z "$SELF_PING_URL" ]; then
+            echo "SELF_PING_URL secret is not set" >&2
+            exit 1
+          fi
+          curl -fsS --retry 3 "$SELF_PING_URL" || true
