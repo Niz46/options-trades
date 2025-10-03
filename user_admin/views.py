@@ -1,28 +1,71 @@
+# user_admin/views.py
+import logging
+import threading
+
 from django.shortcuts import render, redirect, get_object_or_404
 from django.urls import reverse_lazy, reverse
 from django.views.generic import (
     TemplateView,
     ListView,
     DetailView,
-    CreateView,
     DeleteView,
     UpdateView,
     View,
     FormView,
 )
 from django.utils.decorators import method_decorator
-from users.models import User, UserWallet
-from app.models import Withdraw, Deposit, Notification
-from django.contrib import messages
-from .decorators import login_required
-from .forms import AdminEmailForm, AddRemoveFundsForm
-from django.core.mail import send_mail
 from django.conf import settings
-from django.core.mail import EmailMultiAlternatives
+from django.core.mail import send_mail, EmailMultiAlternatives
 from django.template.loader import render_to_string
 from django.db.models import Sum
 from django.db import transaction
+from django.contrib import messages
+
+from users.models import User, UserWallet
+from app.models import Withdraw, Deposit, Notification
 from app.utils import create_notification
+from .decorators import login_required
+from .forms import AdminEmailForm, AddRemoveFundsForm
+
+logger = logging.getLogger(__name__)
+
+
+def send_mail_async(
+    subject: str, message: str, from_email: str, recipient_list: list, **kwargs
+):
+    """
+    Fire-and-forget wrapper for django.core.mail.send_mail.
+    kwargs forwarded to send_mail (e.g. fail_silently, html_message).
+    """
+
+    def _worker():
+        try:
+            send_mail(subject, message, from_email, recipient_list, **kwargs)
+        except Exception:
+            logger.exception("Async send_mail failed")
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        logger.exception("Failed to start send_mail thread")
+
+
+def send_message_async(email_message):
+    """
+    Fire-and-forget wrapper for EmailMessage / EmailMultiAlternatives objects.
+    Accepts an instance with a .send() method.
+    """
+
+    def _worker():
+        try:
+            email_message.send()
+        except Exception:
+            logger.exception("Async EmailMessage.send() failed")
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        logger.exception("Failed to start EmailMessage send thread")
 
 
 def update_user_status(user_id, status):
@@ -37,24 +80,24 @@ class DashboardView(TemplateView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        qs = UserWallet.objects.values("currency") \
-            .annotate(total_balance=Sum("balance"))
+        qs = UserWallet.objects.values("currency").annotate(
+            total_balance=Sum("balance")
+        )
 
         balances = {w["currency"]: w["total_balance"] for w in qs}
 
-        # Safely extract each one:
-        btc  = balances.get("BTC",  0)
-        eth  = balances.get("ETH",  0)
-        usdt = balances.get("USDT", 0)
-        ltc  = balances.get("LTC",  0)
+        btc = balances.get("BTC", 0) or 0
+        eth = balances.get("ETH", 0) or 0
+        usdt = balances.get("USDT", 0) or 0
+        ltc = balances.get("LTC", 0) or 0
 
         ctx["wallet_balances"] = balances
-        ctx["total_balance"]    = btc + eth + usdt + ltc
-        ctx["btc_balance"]      = btc
-        ctx["eth_balance"]      = eth
-        ctx["usdt_balance"]     = usdt
-        ctx["ltc_balance"]      = ltc
-        ctx["deposits"]         = Deposit.objects.order_by("-date_created")[:5]
+        ctx["total_balance"] = btc + eth + usdt + ltc
+        ctx["btc_balance"] = btc
+        ctx["eth_balance"] = eth
+        ctx["usdt_balance"] = usdt
+        ctx["ltc_balance"] = ltc
+        ctx["deposits"] = Deposit.objects.order_by("-date_created")[:5]
         return ctx
 
 
@@ -66,14 +109,12 @@ class ProfileView(View):
     def post(self, request, *args, **kwargs):
         firstName = request.POST.get("firstName")
         lastName = request.POST.get("lastName")
-
         address = request.POST.get("address")
         country = request.POST.get("country")
 
-        user = User.objects.filter(email=request.user.email).update(
+        User.objects.filter(email=request.user.email).update(
             first_name=firstName, last_name=lastName, address=address, country=country
         )
-
         return redirect(reverse("admin:profile"))
 
 
@@ -84,7 +125,6 @@ class UserListView(ListView):
     context_object_name = "users"
 
     def get_queryset(self):
-        # Exclude superusers and staff (admins) from the list
         return User.objects.filter(is_superuser=False, is_staff=False)
 
 
@@ -111,9 +151,7 @@ class UserDetailsView(DetailView):
 class UserDeleteView(DeleteView):
     model = User
     template_name = "user_admin/user/user_confirm_delete.html"
-    success_url = reverse_lazy(
-        "user_admin:user-list"
-    )  # Redirect to the user list after deletion
+    success_url = reverse_lazy("user_admin:user-list")
 
 
 @method_decorator(login_required, name="dispatch")
@@ -134,10 +172,8 @@ class UserWalletDetailsView(DetailView):
 class UserWalletUpdateView(UpdateView):
     model = UserWallet
     template_name = "user_admin/user_balance/user_balance_form.html"
-    fields = ["balance"]  # Fields you want to include in the form
-    success_url = reverse_lazy(
-        "user_admin:user-balance-list"
-    )  # Redirect to the user balance list after update
+    fields = ["balance"]
+    success_url = reverse_lazy("user_admin:user-balance-list")
 
 
 @method_decorator(login_required, name="dispatch")
@@ -184,11 +220,6 @@ def manage_user_funds(request, pk):
     )
 
 
-# -----------------------------
-# Deposit Views
-# -----------------------------
-
-
 @method_decorator(login_required, name="dispatch")
 class DepositListView(ListView):
     model = Deposit
@@ -207,54 +238,46 @@ class DepositDetailView(DetailView):
 class DepositUpdateView(UpdateView):
     model = Deposit
     template_name = "user_admin/deposit/deposit_form.html"
-    fields = ["status"]  # Only allow updating status
+    fields = ["status"]
 
     def form_valid(self, form):
+        # Save deposit and set self.object so later code can safely reference it
         deposit = form.save(commit=False)
         deposit.save()
+        self.object = deposit
 
-        # normalize to code
         mapping = {
-            "Bitcoin":  "BTC",
+            "Bitcoin": "BTC",
             "Ethereum": "ETH",
-            "USDT":     "USDT",
+            "USDT": "USDT",
             "Litecoin": "LTC",
         }
         code = mapping.get(deposit.crypto_currency, deposit.crypto_currency)
 
-        wallet = get_object_or_404(
-            UserWallet,
-            user=deposit.user,
-            currency=code
-        )
+        wallet = get_object_or_404(UserWallet, user=deposit.user, currency=code)
         wallet.balance += deposit.amount
         wallet.save()
 
-        # Send email notification
-        send_mail(
-            "Deposit Successfully Confirmed by Admin",  # Subject
-            "The transaction has been successfully confirmed by the admin.",  # Confirmation message
-            settings.DEFAULT_EMAIL,  # From email (or use the admin's email if necessary)
-            [self.object.user.email],  # The user who made the transaction
+        # Send email notification (async)
+        send_mail_async(
+            "Deposit Successfully Confirmed by Admin",
+            "The transaction has been successfully confirmed by the admin.",
+            settings.DEFAULT_EMAIL,
+            [deposit.user.email],
+            fail_silently=True,
         )
 
         return super().form_valid(form)
 
     def get_success_url(self):
-        # Redirect to the admin dashboard or a specific URL after processing the deposit
-        return reverse_lazy("admin:deposits")  # Adjust according to your URL structure
+        return reverse_lazy("admin:deposits")
 
 
 @method_decorator(login_required, name="dispatch")
 class DepositDeleteView(DeleteView):
     model = Deposit
     template_name = "user_admin/deposit/deposit_confirm_delete.html"
-    success_url = reverse_lazy("admin:deposits")  # Redirect after deletion
-
-
-# -----------------------------
-# Withdrawal Views
-# -----------------------------
+    success_url = reverse_lazy("admin:deposits")
 
 
 @method_decorator(login_required, name="dispatch")
@@ -275,27 +298,24 @@ class WithdrawDetailView(DetailView):
 class WithdrawUpdateView(UpdateView):
     model = Withdraw
     template_name = "user_admin/withdraw/withdraw_form.html"
-    fields = ["status"]  # Only allow updating the status
+    fields = ["status"]
 
     def post(self, request, *args, **kwargs):
-        self.object = self.get_object()  # Get the withdrawal instance
-        previous_status = self.object.status  # Store previous status
-        new_status = request.POST.get("status")  # Get the new status from the form
+        self.object = self.get_object()
+        previous_status = self.object.status
+        new_status = request.POST.get("status")
 
-        # Ensure wallet exists
         wallet = get_object_or_404(
             UserWallet, user=self.object.user, currency=self.object.wallet.currency
         )
 
-        # Start transaction for atomic operations
         with transaction.atomic():
             self.object.status = new_status
             self.object.save()
 
-            # If admin approves the withdrawal and it was previously pending
             if new_status == "Approved" and previous_status == "Pending":
                 if wallet.balance >= self.object.amount:
-                    wallet.balance -= self.object.amount  # Deduct balance
+                    wallet.balance -= self.object.amount
                     wallet.save()
                     create_notification(
                         user=self.object.user,
@@ -306,13 +326,13 @@ class WithdrawUpdateView(UpdateView):
                         request, "Withdrawal approved and balance deducted."
                     )
 
-                    send_mail(
-                        "Withdrawal Processed and Confirmed by Admin",  # Subject
-                        "Your transaction has been processed and confirmed by the admin.",  # Plain-text message for admin confirmation
-                        settings.DEFAULT_EMAIL,  # From email (or use the admin's email if necessary)
-                        [
-                            self.object.user.email
-                        ],  # Recipient list (user who initiated the transaction)
+                    # Send email notification to user (async)
+                    send_mail_async(
+                        "Withdrawal Processed and Confirmed by Admin",
+                        "Your transaction has been processed and confirmed by the admin.",
+                        settings.DEFAULT_EMAIL,
+                        [self.object.user.email],
+                        fail_silently=True,
                     )
 
                 else:
@@ -349,13 +369,13 @@ class AdminEmailView(FormView):
         recipient_email = form.cleaned_data["recipient"]
 
         if recipient_email == "all":
-            recipients = User.objects.filter(
-                is_superuser=False, is_staff=False
-            ).values_list("email", flat=True)
+            recipients = list(
+                User.objects.filter(is_superuser=False, is_staff=False).values_list(
+                    "email", flat=True
+                )
+            )
         else:
             recipients = [recipient_email]
-
-        print(recipients)
 
         context = {
             "user": self.request.user,
@@ -368,11 +388,13 @@ class AdminEmailView(FormView):
         email = EmailMultiAlternatives(
             subject=subject,
             body=message,
-            from_email=settings.EMAIL_HOST_USER,
+            from_email=settings.DEFAULT_EMAIL,
             to=recipients,
         )
         email.attach_alternative(html_message, "text/html")
-        email.send()
+
+        # send using async wrapper
+        send_message_async(email)
 
         messages.success(self.request, "Email sent successfully!")
         return super().form_valid(form)

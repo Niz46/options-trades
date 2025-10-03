@@ -19,6 +19,49 @@ from app.utils import create_notification
 from django.db import transaction
 from django.core.mail import send_mail
 from django.conf import settings
+import logging
+import threading
+
+
+logger = logging.getLogger(__name__)
+
+
+def _send_mail_async(
+    subject: str, message: str, from_email: str, recipient_list: list, **kwargs
+):
+    """
+    Fire-and-forget wrapper for django.core.mail.send_mail.
+    kwargs forwarded to send_mail (e.g. fail_silently, html_message).
+    """
+
+    def _worker():
+        try:
+            send_mail(subject, message, from_email, recipient_list, **kwargs)
+        except Exception:
+            logger.exception("Async send_mail failed")
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        logger.exception("Failed to start send_mail thread")
+
+
+def _send_message_async(email_message):
+    """
+    Fire-and-forget wrapper for EmailMessage / EmailMultiAlternatives objects.
+    Accepts an instance with a .send() method.
+    """
+
+    def _worker():
+        try:
+            email_message.send()
+        except Exception:
+            logger.exception("Async EmailMessage.send() failed")
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        logger.exception("Failed to start EmailMessage send thread")
 
 
 STOCKS = {
@@ -67,11 +110,9 @@ class BuyNow(TemplateView):
 
     def post(self, request, *args, **kwargs):
         # Get the form data
-        paytype = request.POST.get(
-            "paytype"
-        )  # Selected wallet type (e.g., "USDT", "BTC", etc.)
-        stock_id = int(request.POST.get("stock"))  # Selected stock ID
-        quantity = int(request.POST.get("quantity"))  # Selected quantity (slots)
+        paytype = request.POST.get("paytype")
+        stock_id = int(request.POST.get("stock"))
+        quantity = int(request.POST.get("quantity"))
 
         # Calculate the total cost for the stock purchase
         stock = STOCKS.get(stock_id)
@@ -79,7 +120,7 @@ class BuyNow(TemplateView):
             messages.error(request, "Invalid stock selected.")
             return redirect("user:buy-now")
 
-        total_cost = stock["price"] * quantity  # Total cost of the stock
+        total_cost = stock["price"] * quantity
 
         # Get the wallet the user selected
         wallet = UserWallet.objects.filter(user=request.user, currency=paytype).first()
@@ -106,11 +147,10 @@ class BuyNow(TemplateView):
             description=f"You purchased {quantity} slot(s) of {stock['name']} for ${total_cost} using {paytype}.",
         )
 
-        # Redirect to a confirmation page or show a success message
         messages.success(
             request, f"Successfully purchased {quantity} slot(s) of {stock['name']}!"
         )
-        return redirect("user:buy-now")  # Or another confirmation page URL
+        return redirect("user:buy-now")
 
 
 @method_decorator(login_required, name="dispatch")
@@ -149,7 +189,6 @@ class DepositConfirmationView(TemplateView):
         context["method"] = self.request.session.get("deposit_method")
         context["amount"] = self.request.session.get("deposit_amount")
 
-        # Optional: handle case where session data is missing (e.g., user refreshes after session expires)
         if not context["method"] or not context["amount"]:
             context["error"] = "No deposit information found. Please start again."
 
@@ -167,15 +206,14 @@ class DepositConfirmationView(TemplateView):
                 request,
                 "Session expired or missing data. Please start the deposit process again.",
             )
-            return redirect("deposit_start")  # Adjust this to the appropriate view
+            return redirect("deposit_start")
 
-        # Map method to the choices in Deposit.CRYPTO_CHOICES
         method_mapping = {
-            "BITCOIN":  "BTC",
+            "BITCOIN": "BTC",
             "ETHEREUM": "ETH",
-            "USDT":     "USDT",
+            "USDT": "USDT",
             "LITECOIN": "LTC",
-            "BANK":     "BANK",
+            "BANK": "BANK",
         }
 
         crypto_currency = method_mapping.get(method.upper())
@@ -191,19 +229,26 @@ class DepositConfirmationView(TemplateView):
             transaction_id=str(uuid.uuid4())[:20],
         )
 
-        # Send Email Notification
+        # Send Email Notification (async)
         subject = "Deposit Initiated"
         message = f"Hello {request.user.username},\n\nYou have initiated a deposit of ${amount} using {crypto_currency}. Your transaction is currently pending verification."
-        send_mail(subject, message, settings.DEFAULT_EMAIL, [request.user.email])
+        _send_mail_async(
+            subject,
+            message,
+            settings.DEFAULT_EMAIL,
+            [request.user.email],
+            fail_silently=True,
+        )
 
-        # Send Email to Admin
+        # Send Email to Admin (async)
         admin_subject = "New Deposit Request"
         admin_message = f"User {request.user.username} has initiated a deposit of ${amount} using {crypto_currency}. Please verify."
-        send_mail(
+        _send_mail_async(
             admin_subject,
             admin_message,
             settings.DEFAULT_EMAIL,
             [settings.DEFAULT_EMAIL],
+            fail_silently=True,
         )
 
         # Create Notification
@@ -251,7 +296,7 @@ class Withdraw(TemplateView):
         has_balance = any(wallet.balance > Decimal("0.00") for wallet in user_wallets)
 
         context["user_wallets"] = user_wallets
-        context["has_balance"] = has_balance  # Add this to check balance presence
+        context["has_balance"] = has_balance
 
         return context
 
@@ -283,19 +328,26 @@ class Withdraw(TemplateView):
                 status="Pending",
             )
 
-            # Send Email Notification
+            # Send Email Notification (async)
             subject = "Withdrawal Request Submitted"
             message = f"Hello {request.user.username},\n\nYou have requested a withdrawal of ${amount} to the wallet address {wallet_address}. Your request is currently pending approval."
-            send_mail(subject, message, settings.DEFAULT_EMAIL, [request.user.email])
+            _send_mail_async(
+                subject,
+                message,
+                settings.DEFAULT_EMAIL,
+                [request.user.email],
+                fail_silently=True,
+            )
 
-            # Send Email to Admin
+            # Send Email to Admin (async)
             admin_subject = "New Withdrawal Request"
             admin_message = f"User {request.user.username} has requested a withdrawal of ${amount} to {wallet_address}. Please review and approve."
-            send_mail(
+            _send_mail_async(
                 admin_subject,
                 admin_message,
                 settings.DEFAULT_EMAIL,
                 [settings.DEFAULT_EMAIL],
+                fail_silently=True,
             )
 
             create_notification(
@@ -324,29 +376,23 @@ class Invest(TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        # Get the user's wallets and balances
         user_wallets = UserWallet.objects.filter(user=self.request.user)
         context["user_wallets"] = user_wallets
         context["stocks"] = STOCKS
         return context
 
     def post(self, request, *args, **kwargs):
-        # Get the form data
-        paytype = request.POST.get(
-            "paytype"
-        )  # Selected wallet type (e.g., "USDT", "BTC", etc.)
-        stock_id = int(request.POST.get("stock"))  # Selected stock ID
-        quantity = int(request.POST.get("quantity"))  # Selected quantity (slots)
+        paytype = request.POST.get("paytype")
+        stock_id = int(request.POST.get("stock"))
+        quantity = int(request.POST.get("quantity"))
 
-        # Calculate the total cost for the stock purchase
         stock = STOCKS.get(stock_id)
         if not stock:
             messages.error(request, "Invalid stock selected.")
             return redirect("user:invest")
 
-        total_cost = stock["price"] * quantity  # Total cost of the stock
+        total_cost = stock["price"] * quantity
 
-        # Get the wallet the user selected
         wallet = UserWallet.objects.filter(user=request.user, currency=paytype).first()
         if not wallet:
             messages.error(request, "Wallet not found.")
@@ -361,22 +407,19 @@ class Invest(TemplateView):
 
         total_cost_decimal = Decimal(str(total_cost))
 
-        # Deduct the amount from the user's wallet
         wallet.balance -= total_cost_decimal
         wallet.save()
 
-        # Create a notification for the user
         create_notification(
             user=request.user,
             title="Stock Purchase",
             description=f"You purchased {quantity} slot(s) of {stock['name']} for ${total_cost} using {paytype}.",
         )
 
-        # Redirect to a confirmation page or show a success message
         messages.success(
             request, f"Successfully purchased {quantity} slot(s) of {stock['name']}!"
         )
-        return redirect("user:invest")  # Or another confirmation page URL
+        return redirect("user:invest")
 
 
 @method_decorator(login_required, name="dispatch")
@@ -417,7 +460,6 @@ class Profile(TemplateView):
         country = request.POST.get("country")
         bio = request.POST.get("bio")
 
-        # Update user information
         User.objects.filter(email=request.user.email).update(
             first_name=firstName,
             last_name=lastName,
@@ -426,7 +468,6 @@ class Profile(TemplateView):
             bio=bio,
         )
 
-        # Create notification
         create_notification(
             user=request.user,
             title="Profile Updated",
@@ -442,13 +483,14 @@ class Notifications(TemplateView):
     template_name = "user/notifications.html"
 
     def get(self, request, *args, **kwargs):
-        # Mark all unread for this user as read
         Notification.objects.filter(user=request.user, read=False).update(read=True)
         return super().get(request, *args, **kwargs)
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx["notifications"] = Notification.objects.filter(user=self.request.user).order_by("-created_at")
+        ctx["notifications"] = Notification.objects.filter(
+            user=self.request.user
+        ).order_by("-created_at")
         return ctx
 
 
@@ -479,7 +521,6 @@ class ChangePassword(TemplateView):
         user.set_password(new_password)
         user.save()
 
-        # Create notification
         create_notification(
             user=request.user,
             title="Password Changed",
@@ -511,5 +552,4 @@ class TransactionHistory(TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-
         return context
